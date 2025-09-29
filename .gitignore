@@ -1,0 +1,25 @@
+.vev/
+env/
+venv/
+git config --list --show-origin | grep -E "user\.name|user\.email"
+cat > .gitignore << 'EOF'
+# Python
+__pycache__/
+*.py[cod]
+*.log
+
+# Entornos virtuales
+.venv/
+env/
+venv/
+
+# IDE/Editor
+.vscode/
+.idea/
+
+# SO / varios
+.DS_Store
+
+# Bases de datos locales (si aplica)
+*.sqlite
+*.db
