@@ -1,5 +1,10 @@
+# (CLEAN) ya no usamos copy; el dict de promoción se recrea sin rects
+from ai import choose_by_level  # nuevo
+ai_level = 0  # 0: random, 1: greedy
+
 import pygame
 import os
+from dataclasses import dataclass
 
 # ---- FIX de arranque/primer frame (Windows + centrado) ----
 os.environ['SDL_WINDOWS_DPI_AWARENESS'] = 'permonitorv2'
@@ -25,8 +30,15 @@ pygame.display.set_caption('Two-Player Pygame Chess!')
 
 font     = pygame.font.Font('freesansbold.ttf', 20)
 big_font = pygame.font.Font('freesansbold.ttf', 50)
+coord_font = pygame.font.Font('freesansbold.ttf', 14)
 timer    = pygame.time.Clock()
 fps      = 60
+
+# UX
+flipped = False      # F: ver tablero desde negras
+show_hints = True    # H: mostrar/ocultar puntos de destino
+show_help = False  # F1: mostrar/ocultar ayuda de teclas
+
 
 # -------- Colores --------
 COL_BG = (50, 50, 50)
@@ -38,6 +50,7 @@ COL_TXT = (0, 0, 0)
 COL_RED = (220, 30, 30)
 COL_BLUE = (30, 60, 220)
 COL_LAST = (255, 215, 0)
+COL_EP = (0, 200, 200)  # resaltado en passant
 
 # === SONIDOS: cargar (MP3) ===
 START_SOUND = MOVE_SOUND = CAPTURE_SOUND = None
@@ -70,6 +83,9 @@ white_rook_h_moved = False   # torre en (7,0)
 black_king_moved = False
 black_rook_a_moved = False   # torre en (0,7)
 black_rook_h_moved = False   # torre en (7,7)
+
+# (Opcional futuro) En passant
+ep_target = None  # casilla susceptible de captura al paso tras un doble paso; no se usa aún
 
 # =================== CARGA DE IMÁGENES ORIGINALES (sin escalar) ===================
 def _load_img(path):
@@ -114,11 +130,12 @@ def _scaled_for_square(square):
 
     # tamaños relativos (idénticos a tu layout original)
     big = int(square * 0.80)    # 80 px cuando square=100
-    pawn_big = int(square * 0.65)  # 65 px cuando square=100
+    pawn_big = int(square * 0.90)  # 90 px cuando square=100
     small = int(square * 0.45)   # miniaturas panel
 
-    def sc(img, w, h): 
+    def sc(img, w, h):
         w=max(1,int(w)); h=max(1,int(h))
+        # Para pixel art puro cambia a: pygame.transform.scale(img, (w, h))
         return pygame.transform.smoothscale(img, (w, h))
 
     # blancos grandes
@@ -172,12 +189,17 @@ def reset_game_state():
     global white_options, black_options, counter
     global white_king_moved, white_rook_a_moved, white_rook_h_moved
     global black_king_moved, black_rook_a_moved, black_rook_h_moved
+    global ep_target
+    # [FIX] también reseteamos flags de promoción y arrastre
+    global promotion_pending, awaiting_promotion
+    global dragging, drag_index, drag_color, mouse_pos
 
-    white_pieces[:] = ['rook', 'knight', 'bishop', 'king', 'queen', 'bishop', 'knight', 'rook',
+    # Orden estándar: rook, knight, bishop, queen, king, bishop, knight, rook
+    white_pieces[:] = ['rook', 'knight', 'bishop', 'queen', 'king', 'bishop', 'knight', 'rook',
                        'pawn', 'pawn', 'pawn', 'pawn', 'pawn', 'pawn', 'pawn', 'pawn']
     white_locations[:] = [(0,0), (1,0), (2,0), (3,0), (4,0), (5,0), (6,0), (7,0),
                           (0,1), (1,1), (2,1), (3,1), (4,1), (5,1), (6,1), (7,1)]
-    black_pieces[:] = ['rook', 'knight', 'bishop', 'king', 'queen', 'bishop', 'knight', 'rook',
+    black_pieces[:] = ['rook', 'knight', 'bishop', 'queen', 'king', 'bishop', 'knight', 'rook',
                        'pawn', 'pawn', 'pawn', 'pawn', 'pawn', 'pawn', 'pawn', 'pawn']
     black_locations[:] = [(0,7), (1,7), (2,7), (3,7), (4,7), (5,7), (6,7), (7,7),
                           (0,6), (1,6), (2,6), (3,6), (4,6), (5,6), (6,6), (7,6)]
@@ -199,6 +221,17 @@ def reset_game_state():
     black_king_moved = False
     black_rook_a_moved = False
     black_rook_h_moved = False
+
+    # en passant
+    ep_target = None
+
+    # [FIX] limpiar promoción y arrastre
+    promotion_pending = None
+    awaiting_promotion = False
+    dragging = False
+    drag_index = None
+    drag_color = None
+    mouse_pos = (0, 0)
 
     white_options = check_options(white_pieces, white_locations, "white")
     black_options = check_options(black_pieces, black_locations, "black")
@@ -226,6 +259,25 @@ def board_rect_for(square, win_w, win_h):
     # centrado horizontal dentro del área útil
     margin_left = max((win_w - SIDEBAR_W - board_px) // 2, 0)
     return pygame.Rect(margin_left, 0, board_px, board_px)
+
+def to_screen_xy(cell, square, board_rect):
+    """(x,y) casilla -> esquina superior izquierda en pixeles (respeta flipped)."""
+    x, y = cell
+    if flipped:
+        x = 7 - x
+        y = 7 - y
+    return board_rect.x + x * square, y * square
+
+def mouse_to_cell(pos, square, board_rect):
+    """(mx,my) mouse -> (x,y) casilla o None si fuera (respeta flipped)."""
+    mx, my = pos
+    if not board_rect.collidepoint(mx, my):
+        return None
+    dx = (mx - board_rect.x) // square
+    dy = my // square
+    if not (0 <= dx <= 7 and 0 <= dy <= 7):
+        return None
+    return (7 - dx, 7 - dy) if flipped else (dx, dy)
 
 # =================== ATAQUES / AYUDAS PARA ENROQUE ===================
 def pawn_attacks(position, color):
@@ -274,6 +326,22 @@ def squares_attacked_by(color):
             for s in king_attacks(pos): attacked.add(s)
     return attacked
 
+def piece_at(square):
+    # square: (x, y)
+    if square in white_locations:
+        i = white_locations.index(square)
+        return (white_pieces[i], 'white')
+    if square in black_locations:
+        i = black_locations.index(square)
+        return (black_pieces[i], 'black')
+    return None
+
+def piece_name_by_index(color, idx):
+    return white_pieces[idx] if color == 'white' else black_pieces[idx]
+
+def is_attacked_by(square, by_color):
+    return square in squares_attacked_by(by_color)
+
 def path_clear_between(a, b, blockers):
     """True si entre a=(x1,y) y b=(x2,y) no hay piezas (excluye extremos)."""
     (x1,y1), (x2,y2) = a, b
@@ -284,6 +352,107 @@ def path_clear_between(a, b, blockers):
             return False
     return True
 
+# [MOD] Ajuste de UI (ya tenías estas)
+def _fit_font(text, font_path, max_w, max_h, base_px=50):
+    size = min(base_px, int(max_h * 0.8))
+    while size > 8:
+        f = pygame.font.Font(font_path, size)
+        if f.size(text)[0] <= max_w and f.get_height() <= max_h:
+            return f
+        size -= 1
+    return pygame.font.Font(font_path, 8)
+
+def _blit_centered(surface, surf, rect):
+    x = rect.x + (rect.w - surf.get_width()) // 2
+    y = rect.y + (rect.h - surf.get_height()) // 2
+    surface.blit(surf, (x, y))
+
+# =================== [NUEVO] PROMOCIÓN Y DRAG ===================
+# Estados de promoción y arrastre
+promotion_pending = None     # dict con {'color','index','buttons':{...}}
+awaiting_promotion = False
+
+dragging = False
+drag_index = None
+drag_color = None
+mouse_pos = (0, 0)
+
+def draw_promotion_menu(square):
+    """Dibuja un popup centrado con 4 opciones: dama, torre, alfil, caballo."""
+    global promotion_pending
+    if not promotion_pending:
+        return
+
+    W, H = screen.get_size()
+    shade = pygame.Surface((W, H), pygame.SRCALPHA)
+    shade.fill((0, 0, 0, 120))
+    screen.blit(shade, (0, 0))
+
+    box_w, box_h = int(W * 0.45), int(H * 0.22)
+    box = pygame.Rect((W - box_w)//2, (H - box_h)//2, box_w, box_h)
+    pygame.draw.rect(screen, (235, 235, 235), box, border_radius=14)
+    pygame.draw.rect(screen, COL_GOLD, box, 6, border_radius=14)
+
+    title = "Promoción: elige pieza"
+    f = _fit_font(title, 'freesansbold.ttf', box.w - 40, int(box.h*0.25), base_px=48)
+    surf = f.render(title, True, (20, 20, 20))
+    _blit_centered(screen, surf, pygame.Rect(box.x, box.y+10, box.w, f.get_height()))
+
+    opts = ['queen', 'rook', 'bishop', 'knight']
+    btn_area = pygame.Rect(box.x+20, box.y + box.h//2 - 20, box.w-40, box.h//2 - 30)
+    gap = 12
+    btn_w = (btn_area.w - gap*3) // 4
+    btn_h = btn_area.h
+    btn_h = max(btn_h, 36)  # [FIX] altura mínima para evitar artefactos en ventanas pequeñas
+    rects = {}
+    for i, name in enumerate(opts):
+        r = pygame.Rect(btn_area.x + i*(btn_w+gap), btn_area.y, btn_w, btn_h)
+        pygame.draw.rect(screen, (245,245,245), r, border_radius=10)
+        pygame.draw.rect(screen, (90,90,90), r, 2, border_radius=10)
+        rects[name] = r
+
+    # Íconos según color
+    color = promotion_pending['color']
+    white_imgs, _, black_imgs, _ = _scaled_for_square(square)
+    imgs = white_imgs if color == 'white' else black_imgs
+    name_to_idx = {'pawn':0, 'queen':1, 'king':2, 'knight':3, 'rook':4, 'bishop':5}
+    for name, r in rects.items():
+        idx = name_to_idx[name]
+        icon = imgs[idx]
+        scale = min(int(r.w*0.75), int(r.h*0.75))
+        icon = pygame.transform.smoothscale(icon, (scale, scale))
+        screen.blit(icon, (r.centerx - icon.get_width()//2, r.centery - icon.get_height()//2))
+
+    promotion_pending['buttons'] = rects
+
+def finalize_promotion(choice_piece):
+    """Aplica la pieza elegida y pasa el turno; reevalúa fin de juego."""
+    global promotion_pending, awaiting_promotion, turn_step, game_over
+    if not promotion_pending:
+        return
+    color = promotion_pending['color']
+    idx   = promotion_pending['index']
+
+    if color == 'white':
+        white_pieces[idx] = choice_piece
+        _recalc_options()
+        if in_check('black') and not side_has_legal_move('black'):
+            set_game_over('white')
+        elif (not in_check('black')) and (not side_has_legal_move('black')):
+            set_game_over('draw')
+        turn_step = 2
+    else:
+        black_pieces[idx] = choice_piece
+        _recalc_options()
+        if in_check('white') and not side_has_legal_move('white'):
+            set_game_over('black')
+        elif (not in_check('white')) and (not side_has_legal_move('white')):
+            set_game_over('draw')
+        turn_step = 0
+
+    promotion_pending = None
+    awaiting_promotion = False
+
 # ---- Tablero y panel ----------------------------------------------------------
 def draw_board(square):
     W, H = screen.get_size()
@@ -293,14 +462,14 @@ def draw_board(square):
     for y in range(8):
         for x in range(8):
             if (x + y) % 2 == 0:
-                pygame.draw.rect(screen, COL_BOARD_LIGHT, 
+                pygame.draw.rect(screen, COL_BOARD_LIGHT,
                                  (board_rect.x + x*square, y*square, square, square))
 
     # líneas del tablero
     for i in range(9):
-        pygame.draw.line(screen, COL_BOARD_LINE, 
+        pygame.draw.line(screen, COL_BOARD_LINE,
                          (board_rect.x, i * square), (board_rect.x + board_rect.w, i * square), 2)
-        pygame.draw.line(screen, COL_BOARD_LINE, 
+        pygame.draw.line(screen, COL_BOARD_LINE,
                          (board_rect.x + i * square, 0), (board_rect.x + i * square, board_rect.h), 2)
 
     # barra inferior
@@ -312,21 +481,77 @@ def draw_board(square):
     pygame.draw.rect(screen, COL_PANEL, [W - SIDEBAR_W, 0, SIDEBAR_W, H])
     pygame.draw.rect(screen, COL_GOLD,  [W - SIDEBAR_W, 0, SIDEBAR_W, H], 5)
 
-    # texto inferior
-    if game_over is None:
-        status_text = ['Blanco: Selecciona una pieza a Mover!', 'Blanco: Elige un Destino!',
-                       'Negro: Selecciona una pieza a Mover!',  'Negro: Elige un Destino!'][turn_step]
+    # texto inferior (centrado y con auto-shrink), incluye estado de promoción
+    if awaiting_promotion and promotion_pending:
+        status_text = "Elige pieza para la promoción (Q/R/B/N)"
     else:
-        status_text = ("Tablas por ahogado" if game_over == 'draw'
-                       else ("¡Jaque mate! Ganan Blancas" if game_over == 'white' else "¡Jaque mate! Ganan Negras"))
-    surf = big_font.render(status_text, True, COL_TXT)
-    text_x = (W // 2) - (surf.get_width() // 2)
-    text_y = bar_y + (STATUS_H - surf.get_height()) // 2 - 10
-    screen.blit(surf, (text_x, text_y))
+        if game_over is None:
+            status_text = ['Blanco: Selecciona una pieza a mover', 'Blanco: Elige un destino',
+                           'Negro: Selecciona una pieza a mover',  'Negro: Elige un destino'][turn_step]
+        else:
+            status_text = ("Tablas por ahogado" if game_over == 'draw'
+                           else ("¡Jaque mate! Ganan Blancas" if game_over == 'white' else "¡Jaque mate! Ganan Negras"))
 
-    if game_over is not None:
-        hint = font.render("Presiona R para reiniciar  |  Ctrl+Z para deshacer", True, COL_TXT)
-        screen.blit(hint, ((W - hint.get_width()) // 2, bar_y + 60))
+    # Área de texto sin el panel derecho
+    text_area = pygame.Rect(0, bar_y, max(50, W - SIDEBAR_W), STATUS_H)
+    bar_inner = text_area.inflate(-20, -20)
+
+    font_path = 'freesansbold.ttf'
+    fit_font  = _fit_font(status_text, font_path, bar_inner.w, bar_inner.h, base_px=50)
+    surf      = fit_font.render(status_text, True, COL_TXT)
+    _blit_centered(screen, surf, bar_inner)
+
+def draw_coords(square):
+    """Dibuja letras (archivos) abajo y números (rangos) a la izquierda."""
+    W, H = screen.get_size()
+    board_rect = board_rect_for(square, W, H)
+
+    files = "ABCDEFGH" if not flipped else "HGFEDCBA"
+    for i, ch in enumerate(files):
+        s = coord_font.render(ch, True, (0, 0, 0))
+        x = board_rect.x + i * square + square - s.get_width() - 4
+        y = 8 * square - s.get_height() - 2
+        screen.blit(s, (x, y))
+
+    ranks = ["8","7","6","5","4","3","2","1"] if not flipped else ["1","2","3","4","5","6","7","8"]
+    for j, ch in enumerate(ranks):
+        s = coord_font.render(ch, True, (0, 0, 0))
+        x = board_rect.x + 2
+        y = j * square + 2
+        screen.blit(s, (x, y))
+
+def draw_help_overlay():
+    W, H = screen.get_size()
+    shade = pygame.Surface((W, H), pygame.SRCALPHA)
+    shade.fill((0, 0, 0, 160))
+    screen.blit(shade, (0, 0))
+
+    box_w, box_h = min(520, int(W * 0.7)), min(360, int(H * 0.7))
+    box = pygame.Rect((W - box_w)//2, (H - box_h)//2, box_w, box_h)
+    pygame.draw.rect(screen, (245,245,245), box, border_radius=14)
+    pygame.draw.rect(screen, COL_GOLD, box, 4, border_radius=14)
+
+    lines = [
+        "Atajos:",
+        "F – Flip de tablero",
+        "H – Mostrar/ocultar ayudas",
+        "A – IA juega el turno actual",
+        "0 / 1 – Nivel de IA (aleatorio / greedy)",
+        "Ctrl+Z – Deshacer",
+        "R – Reiniciar (solo si terminó)",
+        "F1 – Mostrar/ocultar esta ayuda"
+    ]
+
+    y = box.y + 18
+    title = pygame.font.Font('freesansbold.ttf', 26).render(lines[0], True, (25,25,25))
+    screen.blit(title, (box.x + 18, y)); y += 36
+
+    f = pygame.font.Font('freesansbold.ttf', 20)
+    for s in lines[1:]:
+        t = f.render(s, True, (35,35,35))
+        screen.blit(t, (box.x + 22, y))
+        y += 28
+
 
 # ---- MINIATURAS DE CAPTURADAS -------------------------------------------------
 def _small_img_for(piece_name, side, square):
@@ -380,14 +605,16 @@ def draw_pieces(square):
 
     # offsets como en tu layout original, pero relativos a la casilla
     off_big = int(square * 0.10)
-    off_pawn_x = int(square * 0.22)
-    off_pawn_y = int(square * 0.30)
+    off_pawn_x = int(square * 0.10)
+    off_pawn_y = int(square * 0.24)
 
+    # mientras se arrastra, no pintamos esa pieza en su casilla
     # blancas
     for i in range(len(white_pieces)):
+        if dragging and drag_color == 'white' and i == drag_index:
+            continue
         index = piece_list.index(white_pieces[i])
-        cell_x = board_rect.x + white_locations[i][0] * square
-        cell_y = white_locations[i][1] * square
+        cell_x, cell_y = to_screen_xy(white_locations[i], square, board_rect)
         if white_pieces[i] == 'pawn':
             screen.blit(white_images[0], (cell_x + off_pawn_x, cell_y + off_pawn_y))
         else:
@@ -397,15 +624,25 @@ def draw_pieces(square):
 
     # negras
     for i in range(len(black_pieces)):
+        if dragging and drag_color == 'black' and i == drag_index:
+            continue
         index = piece_list.index(black_pieces[i])
-        cell_x = board_rect.x + black_locations[i][0] * square
-        cell_y = black_locations[i][1] * square
+        cell_x, cell_y = to_screen_xy(black_locations[i], square, board_rect)
         if black_pieces[i] == 'pawn':
             screen.blit(black_images[0], (cell_x + off_pawn_x, cell_y + off_pawn_y))
         else:
             screen.blit(black_images[index], (cell_x + off_big, cell_y + off_big))
         if turn_step >= 2 and selection == i:
             pygame.draw.rect(screen, COL_BLUE, [cell_x + 1, cell_y + 1, square - 2, square - 2], 2)
+
+    # Pieza arrastrada “en el aire”
+    if dragging and selection != 100:
+        imgs = white_images if drag_color == 'white' else black_images
+        name = (white_pieces if drag_color=='white' else black_pieces)[drag_index]
+        idx  = piece_list.index(name)
+        img  = imgs[idx]
+        mx, my = mouse_pos
+        screen.blit(img, (mx - img.get_width()//2, my - img.get_height()//2))
 
 # ---- Resaltado de última jugada ----------------------------------------------
 def draw_last_move(square):
@@ -414,10 +651,32 @@ def draw_last_move(square):
     W, H = screen.get_size()
     board_rect = board_rect_for(square, W, H)
     (fx, fy), (tx, ty) = last_move
-    pygame.draw.rect(screen, COL_LAST, (board_rect.x + fx*square+2, fy*square+2, square-4, square-4), 3)
-    pygame.draw.rect(screen, COL_LAST, (board_rect.x + tx*square+2, ty*square+2, square-4, square-4), 3)
+    sx1, sy1 = to_screen_xy((fx, fy), square, board_rect)
+    sx2, sy2 = to_screen_xy((tx, ty), square, board_rect)
+    pygame.draw.rect(screen, COL_LAST, (sx1+2, sy1+2, square-4, square-4), 3)
+    pygame.draw.rect(screen, COL_LAST, (sx2+2, sy2+2, square-4, square-4), 3)
 
-# ---- Generación de movimientos (igual a tu lógica, con enroque en king) ------
+def draw_ep_target(square):
+    """Resalta la casilla ep_target (si existe) con un anillo + punto."""
+    if ep_target is None or game_over is not None:
+        return
+
+    W, H = screen.get_size()
+    board_rect = board_rect_for(square, W, H)
+
+    sx, sy = to_screen_xy(ep_target, square, board_rect)
+    cx = sx + square // 2
+    cy = sy + square // 2
+
+    r_outer = max(6, square // 3)   # anillo exterior
+    r_inner = max(3, square // 10)  # punto central
+
+    # anillo
+    pygame.draw.circle(screen, COL_EP, (cx, cy), r_outer, 3)
+    # punto
+    pygame.draw.circle(screen, COL_EP, (cx, cy), r_inner)
+
+# ---- Generación de movimientos (con enroque estándar en king) -----------------
 def check_options(pieces, locations, turn):
     moves_list = []
     all_moves_list = []
@@ -448,9 +707,9 @@ def check_king(position, color):
         if 0 <= nx <= 7 and 0 <= ny <= 7 and (nx, ny) not in friends_list:
             moves_list.append((nx, ny))
 
-    # ===== Enroque =====
+    # ===== Enroque (estándar) =====
     y0 = 0 if color == 'white' else 7
-    king_start = (3, y0)  # tu disposición
+    king_start = (4, y0)
     if position == king_start:
         global white_king_moved, white_rook_a_moved, white_rook_h_moved
         global black_king_moved, black_rook_a_moved, black_rook_h_moved
@@ -462,7 +721,7 @@ def check_king(position, color):
 
         # No estar en jaque ahora
         if (position not in enemies_attacks):
-            # Corto (lado h): rey (3,y)->(5,y), torre (7,y)->(4,y)
+            # Corto (lado h): rey (4,y)->(6,y), torre (7,y)->(5,y)
             rook_h = (7, y0)
             can = False
             if color == 'white':
@@ -470,20 +729,20 @@ def check_king(position, color):
             else:
                 can = (not black_king_moved) and (rook_h in black_locations) and (not black_rook_h_moved)
             if can and path_clear_between(position, rook_h, blockers):
-                through = [(4, y0), (5, y0)]
+                through = [(5, y0), (6, y0)]
                 if all((sq not in enemies_attacks) for sq in through):
-                    moves_list.append((5, y0))
+                    moves_list.append((6, y0))
 
-            # Largo (lado a): rey (3,y)->(1,y), torre (0,y)->(2,y)
+            # Largo (lado a): rey (4,y)->(2,y), torre (0,y)->(3,y)
             rook_a = (0, y0)
             if color == 'white':
                 can = (not white_king_moved) and (rook_a in white_locations) and (not white_rook_a_moved)
             else:
                 can = (not black_king_moved) and (rook_a in black_locations) and (not black_rook_a_moved)
             if can and path_clear_between(position, rook_a, blockers):
-                through = [(2, y0), (1, y0)]
+                through = [(3, y0), (2, y0)]
                 if all((sq not in enemies_attacks) for sq in through):
-                    moves_list.append((1, y0))
+                    moves_list.append((2, y0))
     # ====================
     return moves_list
 
@@ -552,29 +811,73 @@ def check_rook(position, color):
     return moves_list
 
 def check_pawn(position, color):
+    # doble paso requiere que la casilla intermedia esté libre
     moves_list = []
+    x, y = position
+    occ_white = set(white_locations)
+    occ_black = set(black_locations)
+    occ = occ_white | occ_black
+
     if color == 'white':
-        if (position[0], position[1] + 1) not in white_locations and \
-           (position[0], position[1] + 1) not in black_locations and position[1] < 7:
-            moves_list.append((position[0], position[1] + 1))
-        if (position[0], position[1] + 2) not in white_locations and \
-           (position[0], position[1] + 2) not in black_locations and position[1] == 1:
-            moves_list.append((position[0], position[1] + 2))
-        if (position[0] + 1, position[1] + 1) in black_locations:
-            moves_list.append((position[0] + 1, position[1] + 1))
-        if (position[0] - 1, position[1] + 1) in black_locations:
-            moves_list.append((position[0] - 1, position[1] + 1))
-    else:
-        if (position[0], position[1] - 1) not in white_locations and \
-           (position[0], position[1] - 1) not in black_locations and position[1] > 0:
-            moves_list.append((position[0], position[1] - 1))
-        if (position[0], position[1] - 2) not in white_locations and \
-           (position[0], position[1] - 2) not in black_locations and position[1] == 6:
-            moves_list.append((position[0], position[1] - 2))
-        if (position[0] + 1, position[1] - 1) in white_locations:
-            moves_list.append((position[0] + 1, position[1] - 1))
-        if (position[0] - 1, position[1] - 1) in white_locations:
-            moves_list.append((position[0] - 1, position[1] - 1))
+        one = (x, y+1)
+        two = (x, y+2)
+        # avance 1
+        if y < 7 and one not in occ:
+            moves_list.append(one)
+            # avance 2 (solo desde y==1 y si (x,y+1) estaba libre)
+            if y == 1 and two not in occ:
+                moves_list.append(two)
+        # capturas normales
+        if (x+1, y+1) in occ_black: moves_list.append((x+1, y+1))
+        if (x-1, y+1) in occ_black: moves_list.append((x-1, y+1))
+
+        # --- EN PASSANT: diagonal a ep_target ---
+        if ep_target is not None:
+            # derecha
+            if ep_target == (x+1, y+1):
+                cap_sq = (x+1, y)  # donde está el peón negro que dio doble paso
+                if cap_sq in black_locations:
+                    idx = black_locations.index(cap_sq)
+                    if black_pieces[idx] == 'pawn':
+                        moves_list.append(ep_target)
+            # izquierda
+            if ep_target == (x-1, y+1):
+                cap_sq = (x-1, y)
+                if cap_sq in black_locations:
+                    idx = black_locations.index(cap_sq)
+                    if black_pieces[idx] == 'pawn':
+                        moves_list.append(ep_target)
+
+    else:  # black
+        one = (x, y-1)
+        two = (x, y-2)
+        # avance 1
+        if y > 0 and one not in occ:
+            moves_list.append(one)
+            # avance 2 (solo desde y==6 y si (x,y-1) estaba libre)
+            if y == 6 and two not in occ:
+                moves_list.append(two)
+        # capturas normales
+        if (x+1, y-1) in occ_white: moves_list.append((x+1, y-1))
+        if (x-1, y-1) in occ_white: moves_list.append((x-1, y-1))
+
+        # --- EN PASSANT: diagonal a ep_target ---
+        if ep_target is not None:
+            # derecha
+            if ep_target == (x+1, y-1):
+                cap_sq = (x+1, y)  # donde está el peón blanco que dio doble paso
+                if cap_sq in white_locations:
+                    idx = white_locations.index(cap_sq)
+                    if white_pieces[idx] == 'pawn':
+                        moves_list.append(ep_target)
+            # izquierda
+            if ep_target == (x-1, y-1):
+                cap_sq = (x-1, y)
+                if cap_sq in white_locations:
+                    idx = white_locations.index(cap_sq)
+                    if white_pieces[idx] == 'pawn':
+                        moves_list.append(ep_target)
+
     return moves_list
 
 # ---- Helpers de selección / jaque / simulación --------------------------------
@@ -583,100 +886,184 @@ def check_valid_moves():
     return options_list[selection]
 
 def draw_valid(moves, square):
+    # no dibujar si el modal de promoción está activo o si ocultamos ayudas
+    if (awaiting_promotion and promotion_pending) or (not show_hints) or selection == 100:
+        return
+
     color = COL_RED if turn_step < 2 else COL_BLUE
     W, H = screen.get_size()
     board_rect = board_rect_for(square, W, H)
-    for mv in moves:
-        pygame.draw.circle(screen, color, 
-                           (board_rect.x + mv[0] * square + square//2, mv[1] * square + square//2), 5)
 
+    # piezas del rival según a quién le toca
+    opp_locs = set(black_locations if turn_step < 2 else white_locations)
+    # pieza seleccionada (para detectar en-passant)
+    sel_piece = (white_pieces if turn_step < 2 else black_pieces)[selection]
+
+    for mv in moves:
+        sx, sy = to_screen_xy(mv, square, board_rect)
+        cx = sx + square // 2
+        cy = sy + square // 2
+
+        # ¿es captura? (incluye en-passant)
+        is_capture = (mv in opp_locs)
+        if not is_capture and sel_piece == 'pawn' and ep_target is not None and mv == ep_target:
+            is_capture = True
+
+        if is_capture:
+            # anillo para captura
+            pygame.draw.circle(screen, color, (cx, cy), max(6, square // 3), 3)
+        else:
+            # punto para movimiento silencioso
+            pygame.draw.circle(screen, color, (cx, cy), max(4, square // 10))
+
+
+# guarda también el estado de promoción (solo color/índice)
 def _clone_state():
-    # Guardar flags de enroque también
+    pp = None if promotion_pending is None else {
+        'color': promotion_pending.get('color'),
+        'index': promotion_pending.get('index'),
+    }
     return (white_pieces[:], white_locations[:], black_pieces[:], black_locations[:],
             captured_pieces_white[:], captured_pieces_black[:], last_move, turn_step,
             white_king_moved, white_rook_a_moved, white_rook_h_moved,
-            black_king_moved, black_rook_a_moved, black_rook_h_moved)
+            black_king_moved, black_rook_a_moved, black_rook_h_moved, ep_target,
+            awaiting_promotion, pp)
 
+# restaura el estado de promoción
 def _restore_state(state):
     global white_pieces, white_locations, black_pieces, black_locations
     global captured_pieces_white, captured_pieces_black, last_move, turn_step
     global white_king_moved, white_rook_a_moved, white_rook_h_moved
     global black_king_moved, black_rook_a_moved, black_rook_h_moved
+    global ep_target, awaiting_promotion, promotion_pending
+
     (wp, wl, bp, bl, cpw, cpb, lm, ts,
-     wkm, wra, wrh, bkm, bra, brh) = state
+     wkm, wra, wrh, bkm, bra, brh, ep,
+     ap, pp) = state
+
     white_pieces = wp; white_locations = wl
     black_pieces = bp; black_locations = bl
     captured_pieces_white = cpw; captured_pieces_black = cpb
     last_move = lm; turn_step = ts
     white_king_moved, white_rook_a_moved, white_rook_h_moved = wkm, wra, wrh
     black_king_moved, black_rook_a_moved, black_rook_h_moved = bkm, bra, brh
+    ep_target = ep
+    awaiting_promotion = ap
+    promotion_pending = pp  # los rects se regeneran al dibujar el menú
 
-def _apply_move(color, sel_index, dest):
+# agrega simulate=False
+def _apply_move(color, sel_index, dest, simulate=False):
     global captured_pieces_white, captured_pieces_black
     global white_king_moved, white_rook_a_moved, white_rook_h_moved
     global black_king_moved, black_rook_a_moved, black_rook_h_moved
+    global ep_target, promotion_pending, awaiting_promotion
 
     did_capture = False
+    new_ep = None  # si esta jugada es doble paso, aquí guardamos la casilla intermedia
 
     if color == 'white':
-        # captura si corresponde
+        moved_piece = white_pieces[sel_index]
+        from_sq = white_locations[sel_index]
+
+        # captura normal si hay pieza en el destino
         if dest in black_locations:
             idx = black_locations.index(dest)
             captured_pieces_white.append(black_pieces[idx])
             black_pieces.pop(idx); black_locations.pop(idx)
             did_capture = True
 
-        moved_piece = white_pieces[sel_index]
-        from_sq = white_locations[sel_index]
+        # mover pieza
         white_locations[sel_index] = dest
 
-        # flags de movimiento y enroque
+        # —— EN PASSANT (captura especial) ——:
+        # si el destino coincide con ep_target y somos peón, quitamos el peón negro “atrás”
+        if moved_piece == 'pawn' and ep_target is not None and dest == ep_target:
+            # para blancas, el capturado está justo debajo del destino
+            cap_sq = (dest[0], dest[1]-1)
+            if cap_sq in black_locations:
+                cidx = black_locations.index(cap_sq)
+                if black_pieces[cidx] == 'pawn':
+                    captured_pieces_white.append(black_pieces[cidx])
+                    black_pieces.pop(cidx); black_locations.pop(cidx)
+                    did_capture = True
+
+        # flags enroque
         if moved_piece == 'king':
             white_king_moved = True
-            # enroque corto (3,0)->(5,0) torre (7,0)->(4,0)
-            if from_sq == (3,0) and dest == (5,0):
+            if from_sq == (4,0) and dest == (6,0):
                 if (7,0) in white_locations:
                     r = white_locations.index((7,0))
-                    white_locations[r] = (4,0)
+                    white_locations[r] = (5,0)
                     white_rook_h_moved = True
-            # enroque largo (3,0)->(1,0) torre (0,0)->(2,0)
-            if from_sq == (3,0) and dest == (1,0):
+            if from_sq == (4,0) and dest == (2,0):
                 if (0,0) in white_locations:
                     r = white_locations.index((0,0))
-                    white_locations[r] = (2,0)
+                    white_locations[r] = (3,0)
                     white_rook_a_moved = True
         elif moved_piece == 'rook':
             if from_sq == (0,0): white_rook_a_moved = True
             if from_sq == (7,0): white_rook_h_moved = True
 
-    else:
+        # promoción (no abrir menú en simulación)
+        if moved_piece == 'pawn' and dest[1] == 7 and not simulate:
+            promotion_pending = {'color': 'white', 'index': sel_index}
+            awaiting_promotion = True
+
+        # doble paso → preparar ep_target (casilla intermedia)
+        if moved_piece == 'pawn' and abs(dest[1] - from_sq[1]) == 2:
+            new_ep = (from_sq[0], (from_sq[1] + dest[1]) // 2)
+
+    else:  # black
+        moved_piece = black_pieces[sel_index]
+        from_sq = black_locations[sel_index]
+
         if dest in white_locations:
             idx = white_locations.index(dest)
             captured_pieces_black.append(white_pieces[idx])
             white_pieces.pop(idx); white_locations.pop(idx)
             did_capture = True
 
-        moved_piece = black_pieces[sel_index]
-        from_sq = black_locations[sel_index]
         black_locations[sel_index] = dest
+
+        # —— EN PASSANT (captura especial) ——:
+        if moved_piece == 'pawn' and ep_target is not None and dest == ep_target:
+            # para negras, el capturado está justo encima del destino
+            cap_sq = (dest[0], dest[1]+1)
+            if cap_sq in white_locations:
+                cidx = white_locations.index(cap_sq)
+                if white_pieces[cidx] == 'pawn':
+                    captured_pieces_black.append(white_pieces[cidx])
+                    white_pieces.pop(cidx); white_locations.pop(cidx)
+                    did_capture = True
 
         if moved_piece == 'king':
             black_king_moved = True
-            # enroque corto (3,7)->(5,7) torre (7,7)->(4,7)
-            if from_sq == (3,7) and dest == (5,7):
+            if from_sq == (4,7) and dest == (6,7):
                 if (7,7) in black_locations:
                     r = black_locations.index((7,7))
-                    black_locations[r] = (4,7)
+                    black_locations[r] = (5,7)
                     black_rook_h_moved = True
-            # enroque largo (3,7)->(1,7) torre (0,7)->(2,7)
-            if from_sq == (3,7) and dest == (1,7):
+            if from_sq == (4,7) and dest == (2,7):
                 if (0,7) in black_locations:
                     r = black_locations.index((0,7))
-                    black_locations[r] = (2,7)
+                    black_locations[r] = (3,7)
                     black_rook_a_moved = True
         elif moved_piece == 'rook':
             if from_sq == (0,7): black_rook_a_moved = True
             if from_sq == (7,7): black_rook_h_moved = True
+
+        if moved_piece == 'pawn' and dest[1] == 0 and not simulate:
+            promotion_pending = {'color': 'black', 'index': sel_index}
+            awaiting_promotion = True
+
+        # doble paso → preparar ep_target (casilla intermedia)
+        if moved_piece == 'pawn' and abs(dest[1] - from_sq[1]) == 2:
+            new_ep = (from_sq[0], (from_sq[1] + dest[1]) // 2)
+
+    # IMPORTANTÍSIMO:
+    # El derecho de en passant dura sólo la respuesta del rival.
+    # Si esta jugada NO fue un doble paso, se limpia (None).
+    ep_target = new_ep
 
     return did_capture
 
@@ -691,10 +1078,11 @@ def in_check(color):
     attacks = squares_attacked_by('black' if color == 'white' else 'white')
     return king_sq in attacks
 
+# usa simulate=True para evitar menú de promoción en la simulación
 def leaves_king_in_check(color, sel_index, dest):
     state = _clone_state()
     try:
-        _apply_move(color, sel_index, dest)
+        _apply_move(color, sel_index, dest, simulate=True)
         return in_check(color)
     finally:
         _restore_state(state)
@@ -723,26 +1111,115 @@ def draw_check(square):
     global counter
     if game_over is not None:
         return
+
     W, H = screen.get_size()
     board_rect = board_rect_for(square, W, H)
-    if turn_step < 2:
-        if 'king' in white_pieces:
-            king_index = white_pieces.index('king')
-            king_location = white_locations[king_index]
-            for opts in black_options:
-                if king_location in opts and counter < 15:
-                    x = board_rect.x + king_location[0] * square + 1
-                    y = king_location[1] * square + 1
-                    pygame.draw.rect(screen, COL_RED, [x, y, square-2, square-2], 4)
+
+    if 'king' in white_pieces and 'king' in black_pieces:
+        w_king = white_locations[white_pieces.index('king')]
+        b_king = black_locations[black_pieces.index('king')]
+
+        if w_king in squares_attacked_by('black') and counter < 15:
+            wx, wy = to_screen_xy(w_king, square, board_rect)
+            pygame.draw.rect(screen, COL_RED,  (wx + 1, wy + 1, square - 2, square - 2), 4)
+
+        if b_king in squares_attacked_by('white') and counter < 15:
+            bx, by = to_screen_xy(b_king, square, board_rect)
+            pygame.draw.rect(screen, COL_BLUE, (bx + 1, by + 1, square - 2, square - 2), 4)
+
+# =================== API para IA (bots) ===================
+@dataclass
+class Move:
+    color: str              # 'white' | 'black'
+    sel_index: int          # índice dentro de white/black_pieces
+    to: tuple[int,int]      # destino (x,y)
+
+def generate_legal_moves(color: str) -> list[Move]:
+    mv = []
+    if color == 'white':
+        opts = check_options(white_pieces, white_locations, 'white')
+        for i, base in enumerate(opts):
+            for dest in base:
+                if not leaves_king_in_check('white', i, dest):
+                    mv.append(Move('white', i, dest))
     else:
-        if 'king' in black_pieces:
-            king_index = black_pieces.index('king')
-            king_location = black_locations[king_index]
-            for opts in white_options:
-                if king_location in opts and counter < 15:
-                    x = board_rect.x + king_location[0] * square + 1
-                    y = king_location[1] * square + 1
-                    pygame.draw.rect(screen, COL_BLUE, [x, y, square-2, square-2], 4)
+        opts = check_options(black_pieces, black_locations, 'black')
+        for i, base in enumerate(opts):
+            for dest in base:
+                if not leaves_king_in_check('black', i, dest):
+                    mv.append(Move('black', i, dest))
+    return mv
+
+def make_move(m: Move):
+    # respetar promoción pendiente: no cerrar turno hasta elegir
+    global last_move, turn_step
+    history.append(_clone_state())
+    if m.color == 'white':
+        from_sq = white_locations[m.sel_index]; to_sq = m.to
+        last_move = (from_sq, to_sq)
+        did_capture = _apply_move('white', m.sel_index, to_sq)
+        if did_capture and CAPTURE_SOUND: CAPTURE_SOUND.play()
+        elif MOVE_SOUND: MOVE_SOUND.play()
+        _recalc_options()
+        if awaiting_promotion and promotion_pending:
+            return last_move
+        if in_check('black') and not side_has_legal_move('black'):
+            set_game_over('white')
+        elif (not in_check('black')) and (not side_has_legal_move('black')):
+            set_game_over('draw')
+        turn_step = 2
+    else:
+        from_sq = black_locations[m.sel_index]; to_sq = m.to
+        last_move = (from_sq, to_sq)
+        did_capture = _apply_move('black', m.sel_index, to_sq)
+        if did_capture and CAPTURE_SOUND: CAPTURE_SOUND.play()
+        elif MOVE_SOUND: MOVE_SOUND.play()
+        _recalc_options()
+        if awaiting_promotion and promotion_pending:
+            return last_move
+        if in_check('white') and not side_has_legal_move('white'):
+            set_game_over('black')
+        elif (not in_check('white')) and (not side_has_legal_move('white')):
+            set_game_over('draw')
+        turn_step = 0
+    return last_move
+
+def ai_play_current_turn():
+    if game_over is not None:
+        return
+
+    color = 'white' if turn_step < 2 else 'black'
+
+    mv = choose_by_level(
+        ai_level,
+        color=color,
+        gen_moves=generate_legal_moves,
+        piece_at=piece_at,
+        piece_name_by_index=piece_name_by_index,
+        is_attacked_by=is_attacked_by,
+    )
+    if not mv:
+        return
+
+    make_move(mv)
+
+    # Si la IA promovió, promocionar a dama automáticamente
+    if awaiting_promotion and promotion_pending and promotion_pending.get('color') == color:
+        finalize_promotion('queen')  # la opción simple
+
+def unmake_last():
+    if history:
+        _restore_state(history.pop())
+        _recalc_options()
+
+def _recalc_options():
+    global white_options, black_options
+    black_options = check_options(black_pieces, black_locations, "black")
+    white_options = check_options(white_pieces, white_locations, "white")
+
+def set_game_over(winner):
+    global game_over
+    game_over = winner
 
 # ---- Primer frame sincronizado ----
 def _first_frame(square):
@@ -773,7 +1250,9 @@ while run:
 
     screen.fill(COL_BG)
     draw_board(SQUARE)
+    draw_coords(SQUARE)
     draw_last_move(SQUARE)
+    draw_ep_target(SQUARE)
     draw_pieces(SQUARE)
     draw_captured_panel(SQUARE)
     draw_check(SQUARE)
@@ -781,6 +1260,14 @@ while run:
     if selection != 100 and game_over is None:
         valid_moves = legal_moves_for_selection()
         draw_valid(valid_moves, SQUARE)
+
+    # <<< AQUI: overlay de ayuda (encima de todo menos del popup de promoción)
+    if show_help:
+        draw_help_overlay()
+
+    # dibujar menú de promoción por encima de todo
+    if awaiting_promotion and promotion_pending:
+        draw_promotion_menu(SQUARE)
 
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
@@ -792,66 +1279,109 @@ while run:
             screen = pygame.display.set_mode((w, h), FLAGS)
 
         elif event.type == pygame.KEYDOWN:
+            # Atajos para promoción (bloquea TODO lo demás mientras el modal está abierto)
+            if awaiting_promotion and promotion_pending:
+                keymap = {
+                    pygame.K_q: 'queen',
+                    pygame.K_r: 'rook',
+                    pygame.K_b: 'bishop',
+                    pygame.K_n: 'knight'
+                }
+                if event.key in keymap:
+                    finalize_promotion(keymap[event.key])
+                continue  # no procesar más teclas mientras el modal esté abierto
+
+             # F1: mostrar/ocultar ayuda
+            if event.key == pygame.K_F1:
+                show_help = not show_help
+
+            # Flip de tablero
+            if event.key == pygame.K_f:
+                flipped = not flipped
+
+            # Toggle de ayudas
+            elif event.key == pygame.K_h:
+                show_hints = not show_hints
+
             # Reiniciar (solo si terminó)
-            if event.key == pygame.K_r and game_over is not None:
+            elif event.key == pygame.K_r and game_over is not None:
                 reset_game_state()
+
             # Deshacer (Ctrl+Z)
-            if (event.key == pygame.K_z) and (pygame.key.get_mods() & pygame.KMOD_CTRL):
+            elif (event.key == pygame.K_z) and (pygame.key.get_mods() & pygame.KMOD_CTRL):
                 if history:
                     state = history.pop()
                     _restore_state(state)
-                    black_options = check_options(black_pieces, black_locations, "black")
-                    white_options = check_options(white_pieces, white_locations, "white")
+                    _recalc_options()
                     selection = 100; valid_moves = []; game_over = None
 
+            # === IA: teclas ===
+            elif event.key in (pygame.K_0, pygame.K_KP0):
+                ai_level = 0
+                print("IA nivel 0 (aleatorio)")
+            elif event.key in (pygame.K_1, pygame.K_KP1):
+                ai_level = 1
+                print("IA nivel 1 (greedy)")
+            elif event.key == pygame.K_a:
+                # IA juega el turno ACTUAL (respeta promoción y fin de partida)
+                ai_play_current_turn()
+
+        elif event.type == pygame.MOUSEMOTION:
+            # actualizar posición del mouse para arrastre
+            mouse_pos = event.pos
+
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            # clic en menú de promoción
+            if awaiting_promotion and promotion_pending:
+                rects = promotion_pending.get('buttons', {})
+                for name, r in rects.items():
+                    if r.collidepoint(event.pos):
+                        finalize_promotion(name)
+                        break
+                continue  # bloquear interacción con el tablero
+
             if game_over is not None:
                 continue
 
             # traducir click a coordenadas de casilla según board_rect
             board_r = board_rect_for(SQUARE, W, H)
-            mx, my = event.pos
-            if not board_r.collidepoint(mx, my):
+            click_coords = mouse_to_cell(event.pos, SQUARE, board_r)
+            if click_coords is None:
                 continue
-            x_coord = (mx - board_r.x) // SQUARE
-            y_coord = my // SQUARE
-            click_coords = (x_coord, y_coord)
 
             if turn_step <= 1:   # turno blancas
                 if click_coords in white_locations:
                     selection = white_locations.index(click_coords)
+                    # empezar drag
+                    dragging = True; drag_index = selection; drag_color = 'white'; mouse_pos = event.pos
                     if turn_step == 0:
                         turn_step = 1
                 if selection != 100:
                     legal = legal_moves_for_selection()
-                    if click_coords in legal:
+                    if click_coords in legal:  # clic-directo (sin drag) a destino
                         history.append(_clone_state())
                         from_sq = white_locations[selection]
                         to_sq   = click_coords
                         last_move = (from_sq, to_sq)
-
                         did_capture = _apply_move('white', selection, to_sq)
-
-                        if did_capture and CAPTURE_SOUND:
-                            CAPTURE_SOUND.play()
-                        elif MOVE_SOUND:
-                            MOVE_SOUND.play()
-
-                        black_options = check_options(black_pieces, black_locations, "black")
-                        white_options = check_options(white_pieces, white_locations, "white")
-
-                        if in_check('black') and not side_has_legal_move('black'):
-                            game_over = 'white'
-                        elif (not in_check('black')) and (not side_has_legal_move('black')):
-                            game_over = 'draw'
-
-                        turn_step = 2
-                        selection = 100
-                        valid_moves = []
+                        if did_capture and CAPTURE_SOUND: CAPTURE_SOUND.play()
+                        elif MOVE_SOUND: MOVE_SOUND.play()
+                        _recalc_options()
+                        if awaiting_promotion and promotion_pending:
+                            selection = 100; valid_moves = []
+                        else:
+                            if in_check('black') and not side_has_legal_move('black'):
+                                game_over = 'white'
+                            elif (not in_check('black')) and (not side_has_legal_move('black')):
+                                game_over = 'draw'
+                            turn_step = 2
+                            selection = 100; valid_moves = []
 
             else:               # turno negras
                 if click_coords in black_locations:
                     selection = black_locations.index(click_coords)
+                    # empezar drag
+                    dragging = True; drag_index = selection; drag_color = 'black'; mouse_pos = event.pos
                     if turn_step == 2:
                         turn_step = 3
                 if selection != 100:
@@ -861,25 +1391,64 @@ while run:
                         from_sq = black_locations[selection]
                         to_sq   = click_coords
                         last_move = (from_sq, to_sq)
-
                         did_capture = _apply_move('black', selection, to_sq)
+                        if did_capture and CAPTURE_SOUND: CAPTURE_SOUND.play()
+                        elif MOVE_SOUND: MOVE_SOUND.play()
+                        _recalc_options()
+                        if awaiting_promotion and promotion_pending:
+                            selection = 100; valid_moves = []
+                        else:
+                            if in_check('white') and not side_has_legal_move('white'):
+                                game_over = 'black'
+                            elif (not in_check('white')) and (not side_has_legal_move('white')):
+                                game_over = 'draw'
+                            turn_step = 0
+                            selection = 100; valid_moves = []
 
-                        if did_capture and CAPTURE_SOUND:
-                            CAPTURE_SOUND.play()
-                        elif MOVE_SOUND:
-                            MOVE_SOUND.play()
-
-                        black_options = check_options(black_pieces, black_locations, "black")
-                        white_options = check_options(white_pieces, white_locations, "white")
-
-                        if in_check('white') and not side_has_legal_move('white'):
-                            game_over = 'black'
-                        elif (not in_check('white')) and (not side_has_legal_move('white')):
-                            game_over = 'draw'
-
-                        turn_step = 0
-                        selection = 100
-                        valid_moves = []
+        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            # soltar arrastre (drop)
+            if dragging:
+                dragging = False
+                board_r = board_rect_for(SQUARE, W, H)
+                mx, my = event.pos
+                if board_r.collidepoint(mx, my):
+                    drop = mouse_to_cell((mx, my), SQUARE, board_r)
+                    if selection != 100:
+                        legal = legal_moves_for_selection()
+                        if drop in legal:
+                            history.append(_clone_state())
+                            if drag_color == 'white':
+                                from_sq = white_locations[selection]; to_sq = drop
+                                last_move = (from_sq, to_sq)
+                                did_capture = _apply_move('white', selection, to_sq)
+                                if did_capture and CAPTURE_SOUND: CAPTURE_SOUND.play()
+                                elif MOVE_SOUND: MOVE_SOUND.play()
+                                _recalc_options()
+                                if awaiting_promotion and promotion_pending:
+                                    selection = 100; valid_moves = []
+                                else:
+                                    if in_check('black') and not side_has_legal_move('black'):
+                                        game_over = 'white'
+                                    elif (not in_check('black')) and (not side_has_legal_move('black')):
+                                        game_over = 'draw'
+                                    turn_step = 2
+                                    selection = 100; valid_moves = []
+                            else:
+                                from_sq = black_locations[selection]; to_sq = drop
+                                last_move = (from_sq, to_sq)
+                                did_capture = _apply_move('black', selection, to_sq)
+                                if did_capture and CAPTURE_SOUND: CAPTURE_SOUND.play()
+                                elif MOVE_SOUND: MOVE_SOUND.play()
+                                _recalc_options()
+                                if awaiting_promotion and promotion_pending:
+                                    selection = 100; valid_moves = []
+                                else:
+                                    if in_check('white') and not side_has_legal_move('white'):
+                                        game_over = 'black'
+                                    elif (not in_check('white')) and (not side_has_legal_move('white')):
+                                        game_over = 'draw'
+                                    turn_step = 0
+                                    selection = 100; valid_moves = []
 
     pygame.display.flip()
 
