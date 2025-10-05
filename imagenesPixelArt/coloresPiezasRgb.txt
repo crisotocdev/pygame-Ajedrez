@@ -1,0 +1,4 @@
+Luz 1 (Brillo)	Puntos de luz y reflejos	(250, 250, 240)	#FAFAD0
+Luz 2 (Base)	Tono principal iluminado	(220, 215, 200)	#DCD7C8
+Sombra 3 (Media)	Sombreado de transición	(170, 165, 150)	#AAA596
+Sombra 4 (Profunda)	Sombras más oscuras y contornos	(100, 95, 85)	#645F55
