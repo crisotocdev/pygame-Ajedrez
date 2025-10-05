@@ -23,3 +23,8 @@ venv/
 # Bases de datos locales (si aplica)
 *.sqlite
 *.db
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.DS_Store

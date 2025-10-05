@@ -75,6 +75,7 @@ valid_moves = []
 game_over = None      # None | 'white' | 'black' | 'draw'
 last_move = None      # ((fx,fy),(tx,ty))
 history = []          # pila de estados para deshacer
+ai_busy = False
 
 # ---- Enroque: flags de movimiento de rey y torres ----
 white_king_moved = False
@@ -882,8 +883,10 @@ def check_pawn(position, color):
 
 # ---- Helpers de selección / jaque / simulación --------------------------------
 def check_valid_moves():
-    options_list = white_options if turn_step < 2 else black_options
-    return options_list[selection]
+        options_list = white_options if turn_step < 2 else black_options
+        if selection == 100 or selection < 0 or selection >= len(options_list):
+            return []
+        return options_list[selection]
 
 def draw_valid(moves, square):
     # no dibujar si el modal de promoción está activo o si ocultamos ayudas
@@ -1067,6 +1070,16 @@ def _apply_move(color, sel_index, dest, simulate=False):
 
     return did_capture
 
+def sim_push(move):
+    st = _clone_state()
+    _apply_move(move.color, move.sel_index, move.to, simulate=True)
+    _recalc_options()  # importante: recalcular opciones tras simular
+    return st
+
+def sim_pop(st):
+    _restore_state(st)
+    _recalc_options()
+
 def _king_pos(color):
     if color == 'white':
         k = white_pieces.index('king'); return white_locations[k]
@@ -1089,6 +1102,8 @@ def leaves_king_in_check(color, sel_index, dest):
 
 def legal_moves_for_selection():
     base = check_valid_moves()
+    if not base:
+        return []
     color = 'white' if turn_step < 2 else 'black'
     sel = selection
     return [mv for mv in base if not leaves_king_in_check(color, sel, mv)]
@@ -1185,27 +1200,38 @@ def make_move(m: Move):
     return last_move
 
 def ai_play_current_turn():
-    if game_over is not None:
+    global ai_busy
+    if game_over is not None or ai_busy:
         return
 
-    color = 'white' if turn_step < 2 else 'black'
+    ai_busy = True
+    try:
+        color = 'white' if turn_step < 2 else 'black'
+        mv = choose_by_level(
+            ai_level,
+            color=color,
+            gen_moves=generate_legal_moves,
+            piece_at=piece_at,
+            piece_name_by_index=piece_name_by_index,
+            is_attacked_by=is_attacked_by,
+            # para minimax:
+            sim_push=sim_push,
+            sim_pop=sim_pop,
+            in_check=in_check,
+            side_has_legal_move=side_has_legal_move,
+            last_move=last_move,
+        )
+        if not mv:
+            return
+        make_move(mv)
 
-    mv = choose_by_level(
-        ai_level,
-        color=color,
-        gen_moves=generate_legal_moves,
-        piece_at=piece_at,
-        piece_name_by_index=piece_name_by_index,
-        is_attacked_by=is_attacked_by,
-    )
-    if not mv:
-        return
+        # Si la IA promovió, decide dama por defecto
+        if awaiting_promotion and promotion_pending and promotion_pending.get('color') == color:
+            finalize_promotion('queen')
+    finally:
+        ai_busy = False
 
-    make_move(mv)
 
-    # Si la IA promovió, promocionar a dama automáticamente
-    if awaiting_promotion and promotion_pending and promotion_pending.get('color') == color:
-        finalize_promotion('queen')  # la opción simple
 
 def unmake_last():
     if history:
@@ -1291,12 +1317,12 @@ while run:
                     finalize_promotion(keymap[event.key])
                 continue  # no procesar más teclas mientras el modal esté abierto
 
-             # F1: mostrar/ocultar ayuda
+            # F1: mostrar/ocultar ayuda
             if event.key == pygame.K_F1:
                 show_help = not show_help
 
             # Flip de tablero
-            if event.key == pygame.K_f:
+            elif event.key == pygame.K_f:
                 flipped = not flipped
 
             # Toggle de ayudas
@@ -1322,9 +1348,24 @@ while run:
             elif event.key in (pygame.K_1, pygame.K_KP1):
                 ai_level = 1
                 print("IA nivel 1 (greedy)")
+            elif event.key in (pygame.K_2, pygame.K_KP2):
+                ai_level = 2
+                print("IA nivel 2 (minimax d=2)")
+            elif event.key in (pygame.K_3, pygame.K_KP3):
+                ai_level = 3
+                print("IA nivel 3 (minimax d=3)")
+            elif event.key in (pygame.K_4, pygame.K_KP4):
+                ai_level = 4
+                print("IA nivel 4 (minimax d=3 + quiescence)")
             elif event.key == pygame.K_a:
+                if not ai_busy:
+                    ai_play_current_turn()
+                else:
+                    print("IA pensando... espera a que termine.")
                 # IA juega el turno ACTUAL (respeta promoción y fin de partida)
                 ai_play_current_turn()
+
+
 
         elif event.type == pygame.MOUSEMOTION:
             # actualizar posición del mouse para arrastre
